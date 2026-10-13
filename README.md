@@ -1,2 +1,17 @@
-# aiot-ota-android-releases
-Public APK releases and checksums for the AIoT OTA Android assistant. Application source and signing keys are not stored here.
+# OTA 测试助手 Android 下载
+
+本仓库用于公开发布 APK、更新说明、更新清单和 SHA-256 校验文件。应用源码、账号资料和签名私钥不放在这里。
+
+## 当前状态
+
+目前尚未发布 0.3.1 的签名 APK，也没有可供下载的新版本。请以 [Releases](https://github.com/ckls/aiot-ota-android-releases/releases) 中正式发布的版本及附件为准。
+
+## 安装与更新
+
+1. 在 Releases 选择正式版本，下载 APK，并按需使用随附的 `SHA256SUMS` 核对文件。
+2. 首次安装时，按 Android 提示允许对应下载来源安装应用，然后在系统安装界面确认。
+3. 安装支持在线更新的版本后，可在应用内手动检查更新、下载并发起安装。Android 仍会要求用户在系统界面确认安装。
+
+应用内更新会检查下载大小和 SHA-256、应用包名、递增版本号，以及与已安装应用一致的签名。校验不通过时会停止安装。覆盖更新需要继续使用原签名；不要为了更新而先卸载旧应用，以免丢失本机资料。
+
+发布采用“准备草稿 → 上传 APK 和清单 → 下载回验 → 最后发布”的顺序。公开仓库只接收经过检查的发布文件。
