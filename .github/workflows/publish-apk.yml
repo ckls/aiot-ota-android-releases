@@ -1,0 +1,37 @@
+name: Publish verified APK
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version of the already signed staging bundle
+        required: true
+        default: '0.3.1'
+        type: string
+      publish:
+        description: Publish only after all three draft assets pass readback verification
+        required: true
+        default: false
+        type: boolean
+permissions:
+  contents: write
+concurrency:
+  group: apk-release
+  cancel-in-progress: false
+jobs:
+  publish:
+    if: github.repository == 'ckls/aiot-ota-android-releases' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Read public distribution files
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Validate, upload draft, verify and optionally publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          PUBLISH_RELEASE: ${{ inputs.publish }}
+        run: |
+          python3 .github/scripts/test_distribute.py
+          python3 .github/scripts/distribute.py
