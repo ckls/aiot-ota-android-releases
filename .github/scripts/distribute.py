@@ -5,6 +5,7 @@ from pathlib import Path
 REPO='ckls/aiot-ota-android-releases'
 PIN='a19601dfd8336c2f5835d1461f43b00739347b68076b70797b9ad3201b8657c9'
 MAX=64*1024*1024
+BUILD_TOOLS_VERSION='35.0.0'
 
 def require(ok,message):
     if not ok:raise RuntimeError(message)
@@ -27,11 +28,27 @@ def bundle(version):
     notes=(root/'NOTES.md').read_text('utf-8');require(len(notes)<20000,'Release notes too large')
     return root,m,assets,notes
 
-def inspect(root,m):
+def android_tools():
     sdk=Path(os.environ.get('ANDROID_HOME') or os.environ.get('ANDROID_SDK_ROOT') or '/usr/local/lib/android/sdk')
-    choices=sorted((sdk/'build-tools').glob('*/lib/apksigner.jar'),reverse=True)
-    require(bool(choices),'Runner does not have official Android build tools')
-    tools=choices[0].parents[1];apk=root/m['assetName']
+    # Match the toolchain used to verify this release, rather than silently
+    # adopting a newer CLI/output format when the hosted runner image changes.
+    tools=sdk/'build-tools'/BUILD_TOOLS_VERSION
+    require((tools/'aapt2').is_file() and (tools/'lib/apksigner.jar').is_file(),
+            'Official Android Build Tools '+BUILD_TOOLS_VERSION+' must already be installed; no automatic fallback')
+    return tools
+
+def verify_signer(output):
+    # This parser deliberately supports the pinned SDK 35 output contract.
+    # SDK 37 uses scheme-labelled output; do not silently accept new formats.
+    lines=output.splitlines()
+    counts=[line for line in lines if line.startswith('Number of signers')]
+    certs=[line for line in lines if 'certificate SHA-256 digest' in line
+           and not line.startswith('Source Stamp Signer ')]
+    require(counts==['Number of signers: 1'],'Exactly one unambiguous APK signer is required')
+    require(certs==['Signer #1 certificate SHA-256 digest: '+PIN],'APK signer mismatch or unsupported certificate output')
+
+def inspect(root,m):
+    tools=android_tools();apk=root/m['assetName']
     def run(args):
         p=subprocess.run(list(map(str,args)),capture_output=True,text=True,timeout=90)
         require(p.returncode==0,'Android artifact inspection failed');return p.stdout
@@ -40,8 +57,8 @@ def inspect(root,m):
     minimum=re.findall(r"^(?:sdkVersion|minSdkVersion):'([0-9]+)'$",badge,re.M)
     require(packages==[(m['packageName'],str(m['versionCode']),m['versionName'])] and minimum==['26'],'APK identity mismatch')
     require('application-debuggable' not in badge,'Debuggable APK refused')
-    cert=run(['java','-jar',choices[0],'verify','--verbose','--print-certs','-Werr',apk])
-    require(re.findall(r'^Signer #[0-9]+ certificate SHA-256 digest: ([0-9a-fA-F]+)$',cert,re.M)==[PIN],'APK signer mismatch')
+    cert=run(['java','-jar',tools/'lib/apksigner.jar','verify','--verbose','--print-certs','-Werr',apk])
+    verify_signer(cert)
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self,request,fp,code,message,headers,newurl):return None
@@ -100,6 +117,9 @@ def find_release(api,base,tag):
 def verify_draft(release,tag,commit,version,notes):
     require(isinstance(release,dict) and type(release.get('id')) is int and release['id']>0 and release.get('draft') is True and release.get('prerelease') is False and release.get('tag_name')==tag and release.get('target_commitish')==commit and release.get('name')=='OTA 测试助手 '+version and release.get('body')==notes,'Draft does not match the reviewed bundle; no overwrite')
 
+def verify_published(release,identifier,tag,commit,version,notes):
+    require(isinstance(release,dict) and type(release.get('id')) is int and release['id']==identifier and release.get('draft') is False and release.get('prerelease') is False and release.get('tag_name')==tag and release.get('target_commitish')==commit and release.get('name')=='OTA 测试助手 '+version and release.get('body')==notes,'Published metadata does not match the reviewed draft')
+
 def distribute(version,publish,api,commit,validator=inspect):
     require(re.fullmatch(r'[0-9a-f]{40}',commit),'Invalid distribution commit')
     root,m,assets,notes=bundle(version);validator(root,m)
@@ -134,11 +154,19 @@ def distribute(version,publish,api,commit,validator=inspect):
     require(current['id']==identifier,'Draft identity changed')
     if not publish:print('Verified draft '+tag+'; not published');return
     verify_tag(api,base,tag,commit)
-    api.request('PATCH',base+'/releases/'+str(identifier),{'draft':False,'prerelease':False,'make_latest':'true'})
-    final=api.request('GET',base+'/releases/latest')
-    require(final and final.get('id')==identifier and final.get('tag_name')==tag and final.get('draft') is False and final.get('prerelease') is False,'Formal latest release not confirmed')
-    verify_assets(api,identifier,assets)
-    verify_tag(api,base,tag,commit)
+    try:
+        result=api.request('PATCH',base+'/releases/'+str(identifier),{'draft':False,'prerelease':False,'make_latest':'true'})
+        verify_published(result,identifier,tag,commit,version,notes)
+        final=api.request('GET',base+'/releases/'+str(identifier))
+        verify_published(final,identifier,tag,commit,version,notes)
+        latest=api.request('GET',base+'/releases/latest')
+        verify_published(latest,identifier,tag,commit,version,notes)
+        verify_assets(api,identifier,assets)
+        verify_tag(api,base,tag,commit)
+    except Exception:
+        # A failed PATCH response or readback does not prove publication failed.
+        # Do not retry, overwrite, or delete after the mutation may have applied.
+        raise RuntimeError('Publication outcome is uncertain for '+tag+'; inspect remote state before another attempt. No automatic retry or cleanup was performed.') from None
     print('Published and verified '+tag+' with exactly three assets')
 
 if __name__=='__main__':
