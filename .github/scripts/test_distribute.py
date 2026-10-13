@@ -1,5 +1,6 @@
-import importlib.util,json,socket,unittest
+import importlib.util,json,socket,unittest,tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 spec=importlib.util.spec_from_file_location('distributor',Path(__file__).with_name('distribute.py'))
 p=importlib.util.module_from_spec(spec);spec.loader.exec_module(p)
@@ -27,6 +28,16 @@ class Fake:
             return rows
         return self.release
 class Tests(unittest.TestCase):
+    def test_official_certificate_output_formats_and_wrong_signers(self):
+        root,m,assets,notes=p.bundle('0.3.1')
+        badge="package: name='com.local.aiotota' versionCode='5' versionName='0.3.1'\nminSdkVersion:'26'\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            jar=Path(temporary)/'build-tools/35.0.0/lib/apksigner.jar';jar.parent.mkdir(parents=True);jar.touch()
+            for cert,valid in [('Signer #1 certificate SHA-256 digest: '+p.PIN+'\n',True),('Signer #1 certificate SHA-256 digest: '+p.PIN.upper()+'  \r\n',True),('Signer #1 certificate SHA-256 digest: '+'0'*64+'\n',False),('Signer #1 certificate SHA-256 digest: '+p.PIN+'\nSigner #2 certificate SHA-256 digest: '+p.PIN+'\n',False)]:
+                with self.subTest(cert=cert[:40]),patch.dict('os.environ',{'ANDROID_HOME':temporary}),patch('subprocess.run',side_effect=[SimpleNamespace(returncode=0,stdout=badge),SimpleNamespace(returncode=0,stdout=cert)]):
+                    if valid:p.inspect(root,m)
+                    else:
+                        with self.assertRaises(RuntimeError):p.inspect(root,m)
     def test_exact_manifest_matches_real_signed_file(self):
         root,m,assets,notes=p.bundle('0.3.1')
         self.assertEqual(m['signingCertSha256'],p.PIN);self.assertEqual(m['size'],len(assets[m['assetName']]))

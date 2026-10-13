@@ -29,7 +29,7 @@ def bundle(version):
 
 def inspect(root,m):
     sdk=Path(os.environ.get('ANDROID_HOME') or os.environ.get('ANDROID_SDK_ROOT') or '/usr/local/lib/android/sdk')
-    choices=sorted((sdk/'build-tools').glob('*/lib/apksigner.jar'),reverse=True)
+    choices=list((sdk/'build-tools/35.0.0/lib').glob('apksigner.jar'))
     require(bool(choices),'Runner does not have official Android build tools')
     tools=choices[0].parents[1];apk=root/m['assetName']
     def run(args):
@@ -41,7 +41,11 @@ def inspect(root,m):
     require(packages==[(m['packageName'],str(m['versionCode']),m['versionName'])] and minimum==['26'],'APK identity mismatch')
     require('application-debuggable' not in badge,'Debuggable APK refused')
     cert=run(['java','-jar',choices[0],'verify','--verbose','--print-certs','-Werr',apk])
-    require(re.findall(r'^Signer #[0-9]+ certificate SHA-256 digest: ([0-9a-fA-F]+)$',cert,re.M)==[PIN],'APK signer mismatch')
+    fingerprints=[value.lower() for value in re.findall(r'^Signer #[0-9]+ certificate SHA-256 digest: ([0-9a-fA-F]+)\s*$',cert,re.M)]
+    if fingerprints!=[PIN]:
+        # Public APK certificate metadata only; no signing or GitHub credentials.
+        print('Public APK certificate output: '+json.dumps([line for line in cert.splitlines() if 'SHA-256' in line or 'Signer' in line][:30]))
+    require(fingerprints==[PIN],'APK signer mismatch; parsed fingerprints: '+','.join(fingerprints))
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self,request,fp,code,message,headers,newurl):return None
