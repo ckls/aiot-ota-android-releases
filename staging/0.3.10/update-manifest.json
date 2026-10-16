@@ -1,0 +1,13 @@
+{
+  "assetName": "aiot-ota-mobile-0.3.10.apk",
+  "downloadUrl": "https://github.com/ckls/aiot-ota-android-releases/releases/download/v0.3.10/aiot-ota-mobile-0.3.10.apk",
+  "minSdk": 26,
+  "packageName": "com.local.aiotota",
+  "schemaVersion": 1,
+  "sha256": "4c5330dbc72d43b77431772f78bed6950f570014f104b5cebc0d8b56940ccbb8",
+  "signingCertSha256": "a19601dfd8336c2f5835d1461f43b00739347b68076b70797b9ad3201b8657c9",
+  "size": 291374,
+  "tag": "v0.3.10",
+  "versionCode": 14,
+  "versionName": "0.3.10"
+}
