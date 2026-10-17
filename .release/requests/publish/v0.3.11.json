@@ -1,0 +1,13 @@
+{
+  "artifacts": {
+    "apk_sha256": "6a6729ccce01201fbee8d09923d3f37f584de4b0d96828dc6b19bae6f79dbfcb",
+    "checksum_sha256": "ce113a5b3e4d959037d93762450995f7c8eb5c0c4c2fed7dd056b7ab7e3a179f",
+    "manifest_sha256": "cf210e61897b4077022b25575ea0791246e136d594f59f840f624c7067371009"
+  },
+  "base_main_sha": "edb1fc5322e4269a1d852d3577de231546f43a81",
+  "operation": "public-publish",
+  "repository": "ckls/aiot-ota-android-releases",
+  "schema_version": 1,
+  "version": "0.3.11",
+  "version_code": 15
+}
