@@ -12,30 +12,61 @@ on:
         required: true
         default: false
         type: boolean
+  push:
+    branches: [main]
+    paths: ['.release/requests/publish/**']
 permissions:
-  contents: write
+  contents: read
 concurrency:
   group: apk-release
   cancel-in-progress: false
 jobs:
+  validate-request:
+    if: github.repository == 'ckls/aiot-ota-android-releases' && github.ref == 'refs/heads/main' && github.event_name == 'push' && github.actor == 'ckls' && github.triggering_actor == 'ckls'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Read the exact request commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Check request shape and current main without release write permission
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/publish_request.py validate
   publish:
-    if: github.repository == 'ckls/aiot-ota-android-releases' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
+    needs: [validate-request]
+    if: always() && !cancelled() && github.repository == 'ckls/aiot-ota-android-releases' && github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.actor == 'ckls' && github.triggering_actor == 'ckls' && needs.validate-request.result == 'success'))
+    permissions:
+      contents: write
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Read public distribution files
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
           persist-credentials: false
       - name: Require the verified Android Build Tools 35.0.0
         run: |
           test -x "$ANDROID_HOME/build-tools/35.0.0/aapt2"
           test -f "$ANDROID_HOME/build-tools/35.0.0/lib/apksigner.jar"
+      - name: Run offline distribution regressions
+        run: |
+          python3 .github/scripts/test_distribute.py
+          python3 .github/scripts/test_publish_request.py
       - name: Validate, upload draft, verify and optionally publish
+        if: github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ inputs.version }}
           PUBLISH_RELEASE: ${{ inputs.publish }}
-        run: |
-          python3 .github/scripts/test_distribute.py
-          python3 .github/scripts/distribute.py
+        run: python3 .github/scripts/distribute.py
+      - name: Recheck the owner request, verify draft assets and publish
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/publish_request.py publish

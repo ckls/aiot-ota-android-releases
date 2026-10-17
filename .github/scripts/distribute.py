@@ -120,16 +120,30 @@ def verify_draft(release,tag,commit,version,notes):
 def verify_published(release,identifier,tag,commit,version,notes):
     require(isinstance(release,dict) and type(release.get('id')) is int and release['id']==identifier and release.get('draft') is False and release.get('prerelease') is False and release.get('tag_name')==tag and release.get('target_commitish')==commit and release.get('name')=='OTA 测试助手 '+version and release.get('body')==notes,'Published metadata does not match the reviewed draft')
 
-def distribute(version,publish,api,commit,validator=inspect):
+def distribute(version,publish,api,commit,validator=inspect,*,allow_published=False,before_mutation=lambda:None,verify_only=False,resume_existing=True):
     require(re.fullmatch(r'[0-9a-f]{40}',commit),'Invalid distribution commit')
     root,m,assets,notes=bundle(version);validator(root,m)
     repo=api.request('GET','/repos/'+REPO)
     require(repo and repo.get('full_name')==REPO and repo.get('private') is False and not repo.get('fork') and not repo.get('archived'),'Distribution repository not verified')
     tag=m['tag'];base='/repos/'+REPO
     release=find_release(api,base,tag)
+    if allow_published and release and release.get('draft') is False:
+        # An owner-request rerun is idempotent only after verifying everything.
+        # Never re-publish, move the tag, change latest, or replace any asset.
+        identifier=release.get('id')
+        require(type(identifier) is int and identifier>0,'Invalid published release identity')
+        verify_published(release,identifier,tag,commit,version,notes)
+        verify_tag(api,base,tag,commit)
+        verify_assets(api,identifier,assets)
+        verify_published(api.request('GET',base+'/releases/'+str(identifier)),identifier,tag,commit,version,notes)
+        verify_tag(api,base,tag,commit)
+        print('Already published and verified '+tag+'; no mutation made');return
+    require(not verify_only,'Rerun may only verify an exact published release; inspect incomplete state before a new explicit action')
+    require(resume_existing or release is None,'Existing incomplete release requires explicit inspection; no automatic resume')
     if release:
         verify_draft(release,tag,commit,version,notes)
     ref=api.request('GET',base+'/git/ref/tags/'+tag)
+    require(resume_existing or ref is None,'Existing release tag requires explicit inspection; no automatic resume')
     if ref:verify_tag(api,base,tag,commit)
     latest=api.request('GET',base+'/releases/latest')
     if latest:
@@ -139,21 +153,26 @@ def distribute(version,publish,api,commit,validator=inspect):
         previous=json.loads(api.request('GET',base+'/releases/assets/'+str(item[0]['id']),raw=True))
         require(m['versionCode']>previous['versionCode'] and tuple(map(int,version.split('.')))>tuple(map(int,previous['versionName'].split('.'))),'Version must increase')
     if ref is None:
+        before_mutation()
         api.request('POST',base+'/git/refs',{'ref':'refs/tags/'+tag,'sha':commit})
         verify_tag(api,base,tag,commit)
     if release is None:
+        before_mutation()
         release=api.request('POST',base+'/releases',{'tag_name':tag,'target_commitish':commit,'name':'OTA 测试助手 '+version,'body':notes,'draft':True,'prerelease':False})
     verify_draft(release,tag,commit,version,notes)
     identifier=release['id']
     present=verify_assets(api,identifier,assets,allow_missing=True)
     for name,data in assets.items():
-        if name not in present:api.request('POST',base+'/releases/'+str(identifier)+'/assets?name='+urllib.parse.quote(name),data,upload=True)
+        if name not in present:
+            before_mutation()
+            api.request('POST',base+'/releases/'+str(identifier)+'/assets?name='+urllib.parse.quote(name),data,upload=True)
     verify_assets(api,identifier,assets)
     current=api.request('GET',base+'/releases/'+str(identifier))
     verify_draft(current,tag,commit,version,notes)
     require(current['id']==identifier,'Draft identity changed')
     if not publish:print('Verified draft '+tag+'; not published');return
     verify_tag(api,base,tag,commit)
+    before_mutation()
     try:
         result=api.request('PATCH',base+'/releases/'+str(identifier),{'draft':False,'prerelease':False,'make_latest':'true'})
         verify_published(result,identifier,tag,commit,version,notes)
