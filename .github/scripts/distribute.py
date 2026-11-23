@@ -6,12 +6,14 @@ REPO='ckls/aiot-ota-android-releases'
 PIN='a19601dfd8336c2f5835d1461f43b00739347b68076b70797b9ad3201b8657c9'
 MAX=64*1024*1024
 BUILD_TOOLS_VERSION='35.0.0'
+VERSION=r'(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})'
+HISTORY_PAGES=10
 
 def require(ok,message):
     if not ok:raise RuntimeError(message)
 def digest(data):return hashlib.sha256(data).hexdigest()
 def bundle(version):
-    require(re.fullmatch(r'(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})',version),'Invalid version')
+    require(re.fullmatch(VERSION,version),'Invalid version')
     root=Path(__file__).resolve().parents[2]/'staging'/version
     name='aiot-ota-mobile-'+version+'.apk'
     require({p.name for p in root.iterdir() if p.is_file()}=={name,'update-manifest.json','SHA256SUMS','NOTES.md'},'Unexpected staging file set')
@@ -114,74 +116,172 @@ def find_release(api,base,tag):
         if len(rows)<100:return matches[0] if matches else None
     raise RuntimeError('Release history exceeds bounded search; no mutation made')
 
-def verify_draft(release,tag,commit,version,notes):
-    require(isinstance(release,dict) and type(release.get('id')) is int and release['id']>0 and release.get('draft') is True and release.get('prerelease') is False and release.get('tag_name')==tag and release.get('target_commitish')==commit and release.get('name')=='OTA 测试助手 '+version and release.get('body')==notes,'Draft does not match the reviewed bundle; no overwrite')
+def release_title(version,prerelease):
+    return 'OTA 测试助手 '+version+(' [测试版]' if prerelease else '')
 
-def verify_published(release,identifier,tag,commit,version,notes):
-    require(isinstance(release,dict) and type(release.get('id')) is int and release['id']==identifier and release.get('draft') is False and release.get('prerelease') is False and release.get('tag_name')==tag and release.get('target_commitish')==commit and release.get('name')=='OTA 测试助手 '+version and release.get('body')==notes,'Published metadata does not match the reviewed draft')
+def verify_draft(release,tag,commit,version,notes,prerelease=False):
+    require(isinstance(release,dict) and type(release.get('id')) is int and release['id']>0 and release.get('draft') is True and release.get('prerelease') is prerelease and release.get('tag_name')==tag and release.get('target_commitish')==commit and release.get('name')==release_title(version,prerelease) and release.get('body')==notes,'Draft does not match the reviewed bundle; no overwrite')
 
-def distribute(version,publish,api,commit,validator=inspect,*,allow_published=False,before_mutation=lambda:None,verify_only=False,resume_existing=True):
+def verify_published(release,identifier,tag,commit,version,notes,prerelease=False):
+    require(isinstance(release,dict) and type(release.get('id')) is int and release['id']==identifier and release.get('draft') is False and release.get('prerelease') is prerelease and release.get('tag_name')==tag and release.get('target_commitish')==commit and release.get('name')==release_title(version,prerelease) and release.get('body')==notes,'Published metadata does not match the reviewed draft')
+
+def verify_stable_latest(api,base,expected):
+    current=api.request('GET',base+'/releases/latest')
+    require(isinstance(current,dict) and type(current.get('id')) is int
+            and current['id']==expected['id'] and current.get('tag_name')==expected['tag']
+            and current.get('target_commitish')==expected['commit']
+            and current.get('draft') is False and current.get('prerelease') is False,
+            'Stable Latest drifted or could not be verified')
+    verify_tag(api,base,expected['tag'],expected['commit'])
+    return current
+
+def previous_version(api,base,identifier,tag):
+    rows=api.request('GET',base+'/releases/'+str(identifier)+'/assets?per_page=100')
+    require(isinstance(rows,list) and len(rows)<100 and all(isinstance(a,dict) for a in rows),
+            'Published release asset set unavailable')
+    candidates=[a for a in rows if a.get('name')=='update-manifest.json']
+    require(len(candidates)==1,'Previous version manifest missing or ambiguous')
+    row=candidates[0]
+    require(type(row.get('id')) is int and row['id']>0 and row.get('state')=='uploaded'
+            and type(row.get('size')) is int and 0<row['size']<16384,
+            'Previous version manifest metadata invalid')
+    data=api.request('GET',base+'/releases/assets/'+str(row['id']),raw=True)
+    require(isinstance(data,bytes) and len(data)==row['size'] and row.get('digest')=='sha256:'+digest(data),
+            'Previous version manifest bytes unverified')
+    def unique(entries):
+        obj={}
+        for key,value in entries:
+            require(key not in obj,'Duplicate previous version manifest key')
+            obj[key]=value
+        return obj
+    try:
+        m=json.loads(data,object_pairs_hook=unique)
+    except (ValueError,UnicodeError) as error:
+        raise RuntimeError('Previous version manifest malformed') from error
+    require(isinstance(m,dict) and set(m)=={'assetName','downloadUrl','minSdk','packageName',
+            'schemaVersion','sha256','signingCertSha256','size','tag','versionCode','versionName'},
+            'Previous version manifest fields unsupported')
+    name='aiot-ota-mobile-'+tag[1:]+'.apk'
+    require(type(m['schemaVersion']) is int and m['schemaVersion']==1
+            and m['packageName']=='com.local.aiotota' and type(m['minSdk']) is int and m['minSdk']==26
+            and m['signingCertSha256']==PIN and m['tag']==tag and m['versionName']==tag[1:]
+            and m['assetName']==name and m['downloadUrl']=='https://github.com/'+REPO+'/releases/download/'+tag+'/'+name
+            and type(m['size']) is int and 0<m['size']<=MAX
+            and isinstance(m['sha256'],str) and re.fullmatch(r'[0-9a-f]{64}',m['sha256'])
+            and type(m['versionCode']) is int and 4<m['versionCode']<=2100000000,
+            'Previous version manifest identity unsupported')
+    return m['versionCode']
+
+def verify_version_high_water(api,base,version,code,latest):
+    # API list is owner-authenticated; drafts do not count. Preserve the
+    # manifest and immutable Android code boundary across both release kinds.
+    seen_ids=set();seen_tags=set();seen_codes=set();stable_by_id={}
+    high_code=0;high_version=(0,0,0)
+    for page in range(1,HISTORY_PAGES+1):
+        rows=api.request('GET',base+'/releases?per_page=100&page='+str(page))
+        require(isinstance(rows,list) and len(rows)<=100,'Version history unavailable')
+        for row in rows:
+            require(isinstance(row,dict) and type(row.get('id')) is int and row['id']>0
+                    and isinstance(row.get('tag_name'),str) and type(row.get('draft')) is bool,
+                    'Version history metadata invalid')
+            identifier=row['id'];tag=row['tag_name']
+            require(identifier not in seen_ids and tag not in seen_tags,'Version history is ambiguous')
+            seen_ids.add(identifier);seen_tags.add(tag)
+            if row['draft']:continue
+            require(type(row.get('prerelease')) is bool and re.fullmatch('v'+VERSION,tag),
+                    'Published version history has an unsupported release')
+            previous_code=previous_version(api,base,identifier,tag)
+            require(previous_code not in seen_codes,'Published versionCode history is ambiguous')
+            seen_codes.add(previous_code)
+            if not row['prerelease']:stable_by_id[identifier]=tag
+            high_code=max(high_code,previous_code)
+            high_version=max(high_version,tuple(map(int,tag[1:].split('.'))))
+        if len(rows)<100:break
+    else:
+        raise RuntimeError('Version history exceeds bounded search; no publication permitted')
+    if latest is not None:
+        require(isinstance(latest,dict) and type(latest.get('id')) is int
+                and latest.get('draft') is False and latest.get('prerelease') is False
+                and latest.get('tag_name')==stable_by_id.get(latest['id'])
+                and latest['id'] in stable_by_id,'Stable Latest not represented in published history')
+    else:
+        require(not stable_by_id,'Stable Latest missing from published history')
+    require(code>high_code and tuple(map(int,version.split('.')))>high_version,
+            'Version must increase beyond all published stable and test releases')
+
+def distribute(version,publish,api,commit,validator=inspect,*,allow_published=False,before_mutation=lambda:None,verify_only=False,resume_existing=True,test_stable=None):
     require(re.fullmatch(r'[0-9a-f]{40}',commit),'Invalid distribution commit')
     root,m,assets,notes=bundle(version);validator(root,m)
     repo=api.request('GET','/repos/'+REPO)
     require(repo and repo.get('full_name')==REPO and repo.get('private') is False and not repo.get('fork') and not repo.get('archived'),'Distribution repository not verified')
     tag=m['tag'];base='/repos/'+REPO
+    prerelease=test_stable is not None
+    if prerelease:
+        require(publish and tag!=test_stable['tag'],'Test release must not reuse the stable version')
+        latest=verify_stable_latest(api,base,test_stable)
+    def guard():
+        before_mutation()
+        if prerelease:verify_stable_latest(api,base,test_stable)
     release=find_release(api,base,tag)
     if allow_published and release and release.get('draft') is False:
         # An owner-request rerun is idempotent only after verifying everything.
         # Never re-publish, move the tag, change latest, or replace any asset.
         identifier=release.get('id')
         require(type(identifier) is int and identifier>0,'Invalid published release identity')
-        verify_published(release,identifier,tag,commit,version,notes)
+        verify_published(release,identifier,tag,commit,version,notes,prerelease)
         verify_tag(api,base,tag,commit)
         verify_assets(api,identifier,assets)
-        verify_published(api.request('GET',base+'/releases/'+str(identifier)),identifier,tag,commit,version,notes)
+        verify_published(api.request('GET',base+'/releases/'+str(identifier)),identifier,tag,commit,version,notes,prerelease)
         verify_tag(api,base,tag,commit)
+        if prerelease:verify_stable_latest(api,base,test_stable)
         print('Already published and verified '+tag+'; no mutation made');return
     require(not verify_only,'Rerun may only verify an exact published release; inspect incomplete state before a new explicit action')
     require(resume_existing or release is None,'Existing incomplete release requires explicit inspection; no automatic resume')
     if release:
-        verify_draft(release,tag,commit,version,notes)
+        verify_draft(release,tag,commit,version,notes,prerelease)
     ref=api.request('GET',base+'/git/ref/tags/'+tag)
     require(resume_existing or ref is None,'Existing release tag requires explicit inspection; no automatic resume')
     if ref:verify_tag(api,base,tag,commit)
-    latest=api.request('GET',base+'/releases/latest')
-    if latest:
-        require(not latest.get('draft') and not latest.get('prerelease'),'Latest release status invalid')
-        old=api.request('GET',base+'/releases/'+str(latest['id'])+'/assets?per_page=100')
-        item=[a for a in old if a['name']=='update-manifest.json'];require(len(item)==1,'Previous version manifest missing')
-        previous=json.loads(api.request('GET',base+'/releases/assets/'+str(item[0]['id']),raw=True))
-        require(m['versionCode']>previous['versionCode'] and tuple(map(int,version.split('.')))>tuple(map(int,previous['versionName'].split('.'))),'Version must increase')
+    if not prerelease:latest=api.request('GET',base+'/releases/latest')
+    verify_version_high_water(api,base,version,m['versionCode'],latest)
     if ref is None:
-        before_mutation()
+        guard()
         api.request('POST',base+'/git/refs',{'ref':'refs/tags/'+tag,'sha':commit})
         verify_tag(api,base,tag,commit)
     if release is None:
-        before_mutation()
-        release=api.request('POST',base+'/releases',{'tag_name':tag,'target_commitish':commit,'name':'OTA 测试助手 '+version,'body':notes,'draft':True,'prerelease':False})
-    verify_draft(release,tag,commit,version,notes)
+        guard()
+        release=api.request('POST',base+'/releases',{'tag_name':tag,'target_commitish':commit,'name':release_title(version,prerelease),'body':notes,'draft':True,'prerelease':prerelease})
+    verify_draft(release,tag,commit,version,notes,prerelease)
     identifier=release['id']
     present=verify_assets(api,identifier,assets,allow_missing=True)
     for name,data in assets.items():
         if name not in present:
-            before_mutation()
+            guard()
             api.request('POST',base+'/releases/'+str(identifier)+'/assets?name='+urllib.parse.quote(name),data,upload=True)
     verify_assets(api,identifier,assets)
     current=api.request('GET',base+'/releases/'+str(identifier))
-    verify_draft(current,tag,commit,version,notes)
+    verify_draft(current,tag,commit,version,notes,prerelease)
     require(current['id']==identifier,'Draft identity changed')
     if not publish:print('Verified draft '+tag+'; not published');return
     verify_tag(api,base,tag,commit)
-    before_mutation()
+    guard()
+    live_latest=verify_stable_latest(api,base,test_stable) if prerelease else api.request('GET',base+'/releases/latest')
+    verify_version_high_water(api,base,version,m['versionCode'],live_latest)
+    guard()
     try:
-        result=api.request('PATCH',base+'/releases/'+str(identifier),{'draft':False,'prerelease':False,'make_latest':'true'})
-        verify_published(result,identifier,tag,commit,version,notes)
+        result=api.request('PATCH',base+'/releases/'+str(identifier),{'draft':False,'prerelease':prerelease,'make_latest':'false' if prerelease else 'true'})
+        verify_published(result,identifier,tag,commit,version,notes,prerelease)
         final=api.request('GET',base+'/releases/'+str(identifier))
-        verify_published(final,identifier,tag,commit,version,notes)
-        latest=api.request('GET',base+'/releases/latest')
-        verify_published(latest,identifier,tag,commit,version,notes)
+        verify_published(final,identifier,tag,commit,version,notes,prerelease)
+        if prerelease:
+            tagged=api.request('GET',base+'/releases/tags/'+tag)
+            verify_published(tagged,identifier,tag,commit,version,notes,True)
+        else:
+            latest=api.request('GET',base+'/releases/latest')
+            verify_published(latest,identifier,tag,commit,version,notes)
         verify_assets(api,identifier,assets)
         verify_tag(api,base,tag,commit)
+        if prerelease:verify_stable_latest(api,base,test_stable)
     except Exception:
         # A failed PATCH response or readback does not prove publication failed.
         # Do not retry, overwrite, or delete after the mutation may have applied.
