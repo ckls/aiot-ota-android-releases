@@ -14,7 +14,7 @@ on:
         type: boolean
   push:
     branches: [main]
-    paths: ['.release/requests/publish/**']
+    paths: ['.release/requests/publish/**', '.release/requests/publish-test/**']
 permissions:
   contents: read
 concurrency:

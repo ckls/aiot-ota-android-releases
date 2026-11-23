@@ -18,7 +18,7 @@ OWNER_ID = '22984376'
 REPOSITORY_ID = '1417051638'
 SHA = r'[0-9a-f]{40}'
 VERSION = r'(?:0|[1-9][0-9]{0,8})\.(?:0|[1-9][0-9]{0,8})\.(?:0|[1-9][0-9]{0,8})'
-REQUEST = r'\.release/requests/publish/v(' + VERSION + r')\.json'
+REQUEST = r'\.release/requests/(publish|publish-test)/v(' + VERSION + r')\.json'
 
 
 def strict_json(data):
@@ -75,6 +75,7 @@ def validate_push(env, event, root=ROOT):
     path = changes[1].decode('utf-8')
     match = re.fullmatch(REQUEST, path)
     d.require(match is not None, 'Unexpected publication request path')
+    test = match.group(1) == 'publish-test'
     entry = git(root, 'ls-tree', commit, '--', path).decode().strip()
     d.require(re.fullmatch(r'100644 blob ' + SHA + r'\t' + re.escape(path), entry),
               'Request must be a non-executable regular Git file')
@@ -85,12 +86,22 @@ def validate_push(env, event, root=ROOT):
     request = strict_json(raw)
     keys = {'schema_version', 'operation', 'repository', 'base_main_sha',
             'version', 'version_code', 'artifacts'}
+    if test:
+        keys.add('stable_latest')
     d.require(isinstance(request, dict) and set(request) == keys, 'Invalid request fields')
     d.require(type(request['schema_version']) is int and request['schema_version'] == 1 and
-              request['operation'] == 'public-publish' and request['repository'] == d.REPO and
-              request['base_main_sha'] == before and request['version'] == match.group(1) and
+              request['operation'] == ('public-publish-test' if test else 'public-publish') and request['repository'] == d.REPO and
+              request['base_main_sha'] == before and request['version'] == match.group(2) and
               type(request['version_code']) is int and 4 < request['version_code'] <= 2100000000,
               'Request identity does not match the staged main commit')
+    if test:
+        stable = request['stable_latest']
+        d.require(isinstance(stable, dict) and set(stable) == {'id', 'tag', 'commit'} and
+                  type(stable['id']) is int and 0 < stable['id'] < 10**19 and
+                  isinstance(stable['tag'], str) and re.fullmatch('v' + VERSION, stable['tag']) and
+                  stable['tag'] != 'v' + request['version'] and
+                  isinstance(stable['commit'], str) and re.fullmatch(SHA, stable['commit']),
+                  'Invalid stable Latest reference for test publication')
     hashes = request['artifacts']
     d.require(isinstance(hashes, dict) and set(hashes) ==
               {'apk_sha256', 'manifest_sha256', 'checksum_sha256'} and
@@ -148,9 +159,10 @@ def publish_request(api, env=os.environ, root=ROOT):
     # workflow_dispatch retains its existing explicit draft/resume behavior.
     attempt = env.get('GITHUB_RUN_ATTEMPT', '')
     d.require(re.fullmatch(r'[1-9][0-9]*', attempt), 'Workflow attempt unavailable')
+    options = {'test_stable': request['stable_latest']} if 'stable_latest' in request else {}
     d.distribute(request['version'], True, api, request['base_main_sha'],
                  allow_published=True, before_mutation=guard,
-                 verify_only=attempt != '1', resume_existing=False)
+                 verify_only=attempt != '1', resume_existing=False, **options)
 
 
 def main():
@@ -165,6 +177,8 @@ def main():
         else:
             request = load_push()
             current_main(api, os.environ['GITHUB_SHA'])
+            if 'stable_latest' in request:
+                d.verify_stable_latest(api, '/repos/' + d.REPO, request['stable_latest'])
             print('Validated request for v' + request['version'] + '; no release mutation made')
     except Exception as error:
         print('Publication request stopped: ' +

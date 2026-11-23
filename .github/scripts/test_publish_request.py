@@ -104,6 +104,203 @@ class RequestTests(unittest.TestCase):
     def test_owner_single_added_request_binds_base_version_and_three_hashes(self):
         self.assertEqual(self.validate(), self.request)
 
+    def test_test_channel_request_requires_exact_distinct_path_operation_and_stable_pin(self):
+        target = self.root / '.release/requests/publish-test/v0.3.11.json'
+        target.parent.mkdir(parents=True)
+        self.path.rename(target)
+        self.path = target
+        pin = {'id': 88, 'tag': 'v0.3.10', 'commit': 'b' * 40}
+        request = dict(self.request, operation='public-publish-test', stable_latest=pin)
+        self.amend(request)
+        self.assertEqual(self.validate(), request)
+        for invalid in (
+                dict(request, operation='public-publish'),
+                dict(request, stable_latest=dict(pin, id=True)),
+                dict(request, stable_latest=dict(pin, tag='v0.3.11')),
+                dict(request, stable_latest=dict(pin, commit='main')),
+                dict(request, stable_latest=dict(pin, extra=True))):
+            with self.subTest(invalid=invalid):
+                self.amend(invalid)
+                with self.assertRaises(RuntimeError):
+                    self.validate()
+        self.amend(self.request)
+        with self.assertRaises(RuntimeError):
+            self.validate()
+
+    def test_test_channel_publish_request_passes_only_validated_options(self):
+        request = dict(self.request, operation='public-publish-test',
+                       stable_latest={'id': 88, 'tag': 'v0.3.10', 'commit': 'b' * 40})
+        with patch.object(q, 'load_push', return_value=request), patch.object(q, 'current_main'), patch.object(d, 'distribute') as distribute:
+            q.publish_request(object(), self.env, self.root)
+        self.assertEqual(distribute.call_args.kwargs['test_stable'], request['stable_latest'])
+        self.assertFalse(distribute.call_args.kwargs['resume_existing'])
+
+    def test_test_release_is_not_latest_and_reads_exact_bytes(self):
+        api = self.make_test_api()
+        self.distribute(api, test_stable=api.pin)
+        self.assertTrue(api.release['prerelease'])
+        self.assertFalse(api.release['draft'])
+        self.assertTrue(api.release['name'].endswith('[测试版]'))
+        self.assertEqual(api.patch_payloads, [{'draft': False, 'prerelease': True, 'make_latest': 'false'}])
+        self.assertTrue(any(path.endswith('/releases/tags/v0.3.11') for method,path in api.calls))
+        patch_index = next(i for i,(method,_) in enumerate(api.calls) if method == 'PATCH')
+        self.assertTrue(any(path.endswith('/releases/latest') for method,path in api.calls[:patch_index]))
+        self.assertTrue(any(path.endswith('/releases/latest') for method,path in api.calls[patch_index+1:]))
+        start = len(api.calls)
+        self.distribute(api, test_stable=api.pin, verify_only=True)
+        self.assert_read_only(api, start)
+        self.assertEqual(sum('/releases/assets/' in path for method,path in api.calls[start:]), 3)
+
+    def test_test_release_fails_closed_on_stable_drift_or_wrong_release_kind(self):
+        for mode in ('before', 'during', 'after', 'wrong-kind'):
+            with self.subTest(mode=mode):
+                api = self.make_test_api(mode)
+                with self.assertRaises(RuntimeError):
+                    self.distribute(api, test_stable=api.pin)
+                if mode == 'before':
+                    self.assert_read_only(api)
+                if mode == 'during':
+                    self.assertFalse(api.patch_payloads)
+                if mode in ('after', 'wrong-kind'):
+                    self.assertEqual(len(api.patch_payloads), 1)
+                self.assertFalse(any(method == 'DELETE' for method, _ in api.calls))
+
+    def test_test_release_successive_increasing_versions(self):
+        for code, earlier in ((15, [('0.3.9', 13, True)]), (16, [('0.3.10', 15, True)])):
+            with self.subTest(code=code):
+                self.manifest['versionCode'] = code
+                api = self.make_test_api(earlier=earlier, stable=('0.3.8', 12))
+                self.distribute(api, test_stable=api.pin)
+                self.assertTrue(api.release['prerelease'])
+
+    def test_publication_cannot_equal_or_undercut_prior_test_version_code(self):
+        for is_test in (True, False):
+            for code in (15, 16):
+                with self.subTest(is_test=is_test, code=code):
+                    self.manifest['versionCode'] = code
+                    api = self.make_test_api(earlier=[('0.3.10', 16, True)], stable=('0.3.9', 13))
+                    kwargs = {'test_stable': api.pin} if is_test else {}
+                    with self.assertRaisesRegex(RuntimeError, 'beyond all published'):
+                        self.distribute(api, **kwargs)
+                    self.assert_read_only(api)
+
+    def test_stable_can_follow_a_test_release_at_higher_version_name_and_code(self):
+        self.manifest['versionCode'] = 17
+        api = self.make_test_api(earlier=[('0.3.10', 16, True)], stable=('0.3.9', 13))
+        self.distribute(api)
+        self.assertEqual(api.patch_payloads, [{'draft':False,'prerelease':False,'make_latest':'true'}])
+
+    def test_history_paginates_and_fails_closed_at_limit_or_duplicate_pages(self):
+        class Paginated:
+            def __init__(self, repeat):
+                self.repeat=repeat
+                self.pages=[]
+            def request(self, method, path):
+                assert method=='GET'
+                n=int(path.rsplit('=',1)[1]);self.pages.append(n)
+                if n==2 and self.repeat is None:return []
+                offset=0 if self.repeat else (n-1)*100
+                return [{'id':offset+j+1,'tag_name':'draft-'+str(offset+j),'draft':True}
+                        for j in range(100)]
+        api=Paginated(None)
+        d.verify_version_high_water(api,'/repos/'+d.REPO,'0.3.11',15,None)
+        self.assertEqual(api.pages,[1,2])
+        for repeat, error in ((True,'ambiguous'),(False,'bounded')):
+            with self.subTest(repeat=repeat),self.assertRaisesRegex(RuntimeError,error):
+                d.verify_version_high_water(Paginated(repeat),'/repos/'+d.REPO,'0.3.11',15,None)
+
+    def test_history_unavailable_ambiguous_or_drifting_fails_before_new_publication(self):
+        for mode in ('missing-history','bad-history','duplicate-history','unsupported-history',
+                     'missing-manifest','bad-manifest','late-history'):
+            with self.subTest(mode=mode):
+                api = self.make_test_api(mode, earlier=[('0.3.9', 13, True)])
+                with self.assertRaises(RuntimeError):
+                    self.distribute(api, test_stable=api.pin)
+                self.assertFalse(api.patch_payloads)
+                if mode != 'late-history':self.assert_read_only(api)
+
+    def test_test_channel_requires_stable_latest(self):
+        api = self.make_test_api('no-latest')
+        with self.assertRaisesRegex(RuntimeError,'Stable Latest drifted'):
+            self.distribute(api, test_stable=api.pin)
+        self.assert_read_only(api)
+
+    def test_test_channel_validated_request_still_requires_actual_owner(self):
+        target = self.root / '.release/requests/publish-test/v0.3.11.json'
+        target.parent.mkdir(parents=True)
+        self.path.rename(target)
+        self.path = target
+        self.amend(dict(self.request, operation='public-publish-test',
+                        stable_latest={'id':88,'tag':'v0.3.10','commit':'b'*40}))
+        with self.assertRaises(RuntimeError):
+            q.validate_push(dict(self.env, GITHUB_ACTOR='someone-else'), self.event,self.root)
+        event = dict(self.event, sender={'login':'ckls','type':'Bot','id':int(q.OWNER_ID)})
+        with self.assertRaises(RuntimeError):
+            q.validate_push(self.env, event, self.root)
+
+    def make_test_api(self, mode=None, earlier=(), stable=('0.3.10',14)):
+        class TestApi(legacy.Fake):
+            pin = {'id': 88, 'tag': 'v'+stable[0], 'commit': 'b' * 40}
+            def __init__(self):
+                super().__init__()
+                self.patch_payloads = []
+                self.historical = {88: (stable[0], stable[1], False)}
+                self.historical.update({90+i:item for i,item in enumerate(earlier)})
+            def history_manifest(self,index):
+                version,code,_=self.historical[index]
+                tag='v'+version
+                name='aiot-ota-mobile-'+version+'.apk'
+                return json.dumps(dict(self_manifest, versionName=version, versionCode=code, tag=tag,
+                                       assetName=name, downloadUrl='https://github.com/'+d.REPO+'/releases/download/'+tag+'/'+name)).encode()
+            def request(self, method, path, body=None, upload=False, raw=False):
+                if path.endswith('/releases/latest'):
+                    self.calls.append((method,path))
+                    if mode == 'no-latest':return None
+                    if self.release and not self.release['draft'] and not self.release['prerelease']:
+                        return self.release
+                    drift = mode == 'before' or (mode == 'during' and self.release) or (mode == 'after' and self.patch_payloads)
+                    return {'id':89 if drift else 88,'tag_name':self.pin['tag'],
+                            'target_commitish':self.pin['commit'],'draft':False,'prerelease':False}
+                stable_row = None
+                if path.endswith('/git/ref/tags/'+self.pin['tag']):
+                    stable_row = {'object':{'type':'commit','sha':self.pin['commit']}}
+                elif '/releases?per_page=' in path:
+                    self.calls.append((method,path))
+                    if mode == 'missing-history':return None
+                    rows = [{'id':i,'tag_name':'v'+v,'draft':False,'prerelease':pre}
+                            for i,(v,c,pre) in self.historical.items()]
+                    if mode == 'duplicate-history':rows.append(dict(rows[0]))
+                    if mode == 'unsupported-history':rows[-1]['tag_name']+='-rc'
+                    if mode == 'bad-history':rows.pop(0)
+                    if mode == 'late-history' and self.release:
+                        self.historical[99]=('0.3.12',50,True)
+                        rows.append({'id':99,'tag_name':'v0.3.12','draft':False,'prerelease':True})
+                    if self.release:rows.append(self.release)
+                    return rows
+                elif '/assets?per_page=100' in path:
+                    release_id=int(path.split('/releases/',1)[1].split('/')[0])
+                    if release_id in self.historical:
+                        data=self.history_manifest(release_id)
+                        stable_row=[] if mode=='missing-manifest' and release_id>=90 else [
+                            {'id':release_id*10,'name':'update-manifest.json','state':'uploaded',
+                             'size':len(data),'digest':'sha256:'+d.digest(data)}]
+                elif raw and '/releases/assets/' in path:
+                    asset_id=int(path.rsplit('/',1)[1])
+                    if asset_id>=880 and asset_id//10 in self.historical:
+                        stable_row=self.history_manifest(asset_id//10)
+                        if mode=='bad-manifest' and asset_id>=900:
+                            stable_row=b'tampered'
+                if stable_row is not None:
+                    self.calls.append((method, path))
+                    return stable_row
+                if method == 'PATCH':
+                    self.patch_payloads.append(dict(body))
+                    if mode == 'wrong-kind':
+                        body = dict(body, prerelease=False)
+                return super().request(method,path,body,upload,raw)
+        self_manifest = self.manifest
+        return TestApi()
+
     def test_context_and_both_real_actor_checks(self):
         values = {'GITHUB_EVENT_NAME': ['workflow_dispatch', 'pull_request', 'pull_request_target'],
                   'GITHUB_REPOSITORY': ['someone/fork', 'ckls/aiot-ota-android'],
@@ -378,20 +575,9 @@ class RequestTests(unittest.TestCase):
     def test_both_version_and_code_must_increase_before_any_mutation(self):
         for old_version, old_code in [('0.3.11', 14), ('0.3.10', 15), ('0.3.12', 16)]:
             with self.subTest(old_version=old_version, old_code=old_code):
-                class Previous(legacy.Fake):
-                    def request(self, method, path, *args, **kwargs):
-                        if path.endswith('/releases/latest'):
-                            self.calls.append((method, path))
-                            return {'id': 90, 'draft': False, 'prerelease': False}
-                        if path.endswith('/releases/90/assets?per_page=100'):
-                            self.calls.append((method, path))
-                            return [{'name': 'update-manifest.json', 'id': 91}]
-                        if path.endswith('/releases/assets/91'):
-                            self.calls.append((method, path))
-                            return json.dumps({'versionName': old_version, 'versionCode': old_code}).encode()
-                        return super().request(method, path, *args, **kwargs)
-                api = Previous()
-                with self.assertRaisesRegex(RuntimeError, 'Version must increase'):
+                api = self.make_test_api(stable=(old_version,old_code))
+                expected = 'Published metadata' if old_version == self.version else 'Version must increase'
+                with self.assertRaisesRegex(RuntimeError, expected):
                     self.distribute(api)
                 self.assert_read_only(api)
 
@@ -412,7 +598,7 @@ class RequestTests(unittest.TestCase):
 
     def test_workflow_permissions_and_event_routes_are_bounded(self):
         workflow = (Path(__file__).resolve().parents[1] / 'workflows/publish-apk.yml').read_text()
-        self.assertIn("paths: ['.release/requests/publish/**']", workflow)
+        self.assertIn("paths: ['.release/requests/publish/**', '.release/requests/publish-test/**']", workflow)
         self.assertIn('permissions:\n  contents: read\n', workflow)
         self.assertEqual(workflow.count('contents: write'), 1)
         self.assertIn('    permissions:\n      contents: write', workflow)
