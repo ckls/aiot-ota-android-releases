@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "operation": "public-publish-test",
+  "repository": "ckls/aiot-ota-android-releases",
+  "base_main_sha": "23a062ca979b68b9deab960b6f8a6cf353e90b52",
+  "version": "0.3.31",
+  "version_code": 35,
+  "artifacts": {
+    "apk_sha256": "073ce1ff37d624e15dc81f223c3d1866d4b18b1e904ef3d1ef4ce8589ffc54ef",
+    "manifest_sha256": "c05b53ce81b6dee8768bc368ec469657916862162e3d4e8d481e56c1ea51a2a6",
+    "checksum_sha256": "7fd1e35432f401b5354342f8e4b90f3ad3640fc9d04adaa0076f6907c4dc33de"
+  },
+  "stable_latest": {
+    "id": 446158650,
+    "tag": "v0.3.28",
+    "commit": "a627fe62f5fc267a62e653938ad0d19774c77288"
+  }
+}
